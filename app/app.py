@@ -1,8 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
 from app.schema import CreatePost
 from app.db import create_db_and_tables, get_async_session, Post
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imagekit
+from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+import shutil
+import os
+import tempfile
+import uuid
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,31 +20,65 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-text_post = [{"1": {"title": "bhavya", "content": "lbraba"}}, 
-             {"2": {"title": "sample post", "content": "this is a test content"}}, 
-             {"3": {"title": "hello world", "content": "welcome to fastapi"}}, 
-             {"4": {"title": "random title", "content": "some random content here"}}, 
-             {"5": {"title": "tech news", "content": "latest updates in technology"}}, 
-             {"6": {"title": "fun fact", "content": "did you know this interesting fact"}}, 
-             {"7": {"title": "recipe", "content": "how to make a simple dish"}}, 
-             {"8": {"title": "travel", "content": "best places to visit this year"}}, 
-             {"9": {"title": "book review", "content": "my thoughts on this book"}}, 
-             {"10": {"title": "music", "content": "favorite songs playlist"}}]
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file_path = None
 
-@app.get("/post")
-def post():
-    return text_post
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
 
-@app.get("/post/{id}")
-def post_id(id: str):
+        upload_result = imagekit.upload_file(
+            file=open(temp_file_path, "rb"),
+            file_name=file.filename,
+            options=UploadFileRequestOptions(
+                use_unique_file_name=True,
+                tags=["backend-upload"]
+            )
+        )
 
-    if id not in text_post:
-        raise HTTPException(status_code=404,detail="id not found")
-    return text_post[id]
+        if upload_result.response_metadata.http_status_code == 200:
+            post = Post(
+                caption=caption,
+                url=upload_result.url,
+                file_type="video" if file.content_type.startswith("video/") else "image",
+                file_name=upload_result.name
+            )
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
+            return post
+        else:
+            raise HTTPException(status_code=upload_result.response_metadata.http_status_code, detail="ImageKit upload failed")
 
-@app.post("/postImage")
-def postImage(CP: CreatePost):
-    new_id = str(len(text_post) + 1)
-    new_post = {new_id: {"title": CP.title, "content": CP.content}}
-    text_post.append(new_post)
-    return new_post
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        file.file.close()
+
+@app.get("/posts")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
+
+    posts_data = []
+
+    for post in posts:
+        posts_data.append({
+            "id": post.id,
+            "caption": post.caption,
+            "url": post.url,
+            "file_type": post.file_type,
+            "file_name": post.file_name,
+            "created_at": post.created_at.isoformat()
+        })
+    return {"posts": posts_data}
